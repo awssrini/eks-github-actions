@@ -1,5 +1,5 @@
 terraform {
-  required_version = "~> 1.9.3"
+  required_version = "~> 1.12.0"
   required_providers {
     aws = {
       source  = "hashicorp/aws"
@@ -10,7 +10,7 @@ terraform {
     bucket         = "poc-srini-terraform-state-s3-bucket"
     region         = "ap-southeast-1"
     key            = "eks/terraform.tfstate"
-    dynamodb_table = "LockID"
+    dynamodb_table = "poc-srini-terraform-locks"
     encrypt        = true
   }
 }
