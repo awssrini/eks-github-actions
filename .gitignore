@@ -1,0 +1,10 @@
+# Ignore all .terraform folders recursively
+**/.terraform/
+
+# Ignore all Terraform state files
+*.tfstate
+*.tfstate.*
+
+# Ignore lock file (optional depending on your use case)
+.terraform.lock.hcl
+
