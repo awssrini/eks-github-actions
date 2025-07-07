@@ -1,0 +1,72 @@
+// Jenkinsfile for ECR Repository Management
+pipeline {
+    agent any // You might want to specify a more specific agent with Terraform installed
+
+    parameters {
+        // No Environment parameter needed if you're not using .tfvars files for ECR
+        // If you want to parameterize the ECR names or other attributes, you could add them here.
+        choice(name: 'Terraform_Action', choices: ['plan', 'apply', 'destroy'], description: 'Choose the Terraform action to perform on ECR repositories.')
+    }
+
+    stages {
+        stage('Checkout Git Repository') {
+            steps {
+                // Ensure you check out the repository where your Jenkinsfile and ecr.tf are located
+                // If this Jenkinsfile is in the root of the eks-github-actions repo, this is correct.
+                git branch: 'main', url: 'https://github.com/awssrini/eks-github-actions.git'
+                sh 'ls -la' // Verify files are checked out
+                sh 'ls -la ecr || echo ecr directory not found' // Confirm ecr directory exists
+            }
+        }
+
+        stage('Initialize Terraform') {
+            steps {
+                withAWS(credentials: 'aws-creds', region: 'ap-southeast-1') { // Ensure 'aws-creds' is configured in Jenkins
+                    sh 'terraform version || echo Terraform not installed - please ensure Terraform is on the agent path'
+                    // Change directory to where ecr.tf is located
+                    sh 'terraform -chdir=ecr/ init'
+                }
+            }
+        }
+
+        stage('Validate Terraform Configuration') {
+            steps {
+                withAWS(credentials: 'aws-creds', region: 'ap-southeast-1') {
+                    // Change directory to where ecr.tf is located
+                    sh 'terraform -chdir=ecr/ validate'
+                }
+            }
+        }
+
+        stage('Perform Terraform Action') {
+            steps {
+                withAWS(credentials: 'aws-creds', region: 'ap-southeast-1') {
+                    script {
+                        // The -chdir=ecr/ ensures Terraform operates only on the ecr.tf file
+                        if (params.Terraform_Action == 'plan') {
+                            sh "terraform -chdir=ecr/ plan"
+                        } else if (params.Terraform_Action == 'apply') {
+                            // -auto-approve is used for automation, but be cautious in production
+                            sh "terraform -chdir=ecr/ apply -auto-approve"
+                        } else if (params.Terraform_Action == 'destroy') {
+                            // -auto-approve is used for automation, but be cautious with destroy in production
+                            sh "terraform -chdir=ecr/ destroy -auto-approve"
+                        } else {
+                            error "Invalid value for Terraform_Action: ${params.Terraform_Action}"
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            echo "Pipeline finished with status: ${currentBuild.currentResult}"
+            sh 'ls -R' // List all files recursively for debugging if needed
+        }
+        failure {
+            echo "Pipeline failed. Check logs above for details."
+        }
+    }
+}
