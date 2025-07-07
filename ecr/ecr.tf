@@ -5,7 +5,7 @@ provider "aws" {
 # --- Frontend ECR Repository ---
 resource "aws_ecr_repository" "frontend" {
   name                 = "frontend"
-  image_tag_mutability = "MUTABLE" # Or "IMMUTABLE" for production builds
+  image_tag_mutability = "MUTABLE"
 
   image_scanning_configuration {
     scan_on_push = true
@@ -35,9 +35,10 @@ resource "aws_ecr_lifecycle_policy" "frontend_lifecycle" {
         rulePriority = 2
         description  = "Keep last 5 tagged images, expire older"
         selection = {
-          tagStatus   = "tagged"
-          countType   = "imageCountMoreThan"
-          countNumber = 5
+          tagStatus     = "tagged"
+          tagPrefixList = [""] # <--- FIX: Add this line to match all tags
+          countType     = "imageCountMoreThan"
+          countNumber   = 5
         }
         action = {
           type = "expire"
@@ -50,7 +51,7 @@ resource "aws_ecr_lifecycle_policy" "frontend_lifecycle" {
 # --- Backend ECR Repository ---
 resource "aws_ecr_repository" "backend" {
   name                 = "backend"
-  image_tag_mutability = "MUTABLE" # Or "IMMUTABLE" for production builds
+  image_tag_mutability = "MUTABLE"
 
   image_scanning_configuration {
     scan_on_push = true
@@ -80,9 +81,10 @@ resource "aws_ecr_lifecycle_policy" "backend_lifecycle" {
         rulePriority = 2
         description  = "Keep last 5 tagged images, expire older"
         selection = {
-          tagStatus   = "tagged"
-          countType   = "imageCountMoreThan"
-          countNumber = 5
+          tagStatus     = "tagged"
+          tagPrefixList = [""] # <--- FIX: Add this line to match all tags
+          countType     = "imageCountMoreThan"
+          countNumber   = 5
         }
         action = {
           type = "expire"
@@ -91,4 +93,3 @@ resource "aws_ecr_lifecycle_policy" "backend_lifecycle" {
     ]
   })
 }
-
