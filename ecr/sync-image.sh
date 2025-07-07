@@ -3,7 +3,7 @@
 # Inputs
 DOCKERHUB_IMAGE="confluentinc/cp-server"
 TAG="7.7.0"
-AWS_REGION="us-east-1"
+AWS_REGION="ap-southeast-1"
 ECR_REPO="cp-server"
 ACCOUNT_ID=$(aws sts get-caller-identity --query 'Account' --output text)
 ECR_IMAGE="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}:${TAG}"
