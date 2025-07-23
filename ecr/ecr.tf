@@ -36,6 +36,7 @@ resource "aws_ecr_lifecycle_policy" "frontend_lifecycle" {
         description  = "Keep last 5 tagged images, expire older"
         selection = {
           tagStatus     = "tagged"
+          tagPrefixList = ["latest"]   # ✅ Mandatory if tagStatus=tagged
           countType     = "imageCountMoreThan"
           countNumber   = 5
         }
@@ -81,6 +82,7 @@ resource "aws_ecr_lifecycle_policy" "backend_lifecycle" {
         description  = "Keep last 5 tagged images, expire older"
         selection = {
           tagStatus     = "tagged"
+          tagPrefixList = ["latest"]   # ✅ Mandatory if tagStatus=tagged
           countType     = "imageCountMoreThan"
           countNumber   = 5
         }
