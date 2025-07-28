@@ -9,6 +9,7 @@ resource "aws_eks_cluster" "eks" {
     subnet_ids              = [aws_subnet.private-subnet[0].id, aws_subnet.private-subnet[1].id, aws_subnet.private-subnet[2].id]
     endpoint_private_access = var.endpoint-private-access
     endpoint_public_access  = var.endpoint-public-access
+    endpoint_public_access  = true
     security_group_ids      = [aws_security_group.eks-cluster-sg.id]
   }
 
