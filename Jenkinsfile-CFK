@@ -1,0 +1,57 @@
+pipeline {
+    agent any
+
+    environment {
+        AWS_ACCOUNT_ID = credentials('ACCOUNT_ID') // Secret Text
+        AWS_ECR_REPO_NAME = credentials('ECR_REPO_CFK') // Secret Text
+        AWS_DEFAULT_REGION = 'ap-southeast-1'
+        REPOSITORY_URI = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com/"
+    }
+        stage('Git Pulling') {
+            steps {
+                git branch: 'main', url: 'https://github.com/awssrini/poc1.git'
+                sh 'ls -la'
+                sh 'ls -la kubernetes_manifests_files || echo kubernetes_manifests_files directory not found'
+            }
+        }
+        stage('OWASP Dependency-Check Scan') {
+            steps {
+                dir('kubernetes_manifests_files') {
+                    dependencyCheck additionalArguments: '--scan ./ --disableYarnAudit --disableNodeAudit', odcInstallation: 'DP-Check'
+                    dependencyCheckPublisher pattern: '**/dependency-check-report.xml'
+                }
+            }
+        }
+
+        stage('Trivy File Scan') {
+            steps {
+                dir('kubernetes_manifests_files') {
+                    sh 'trivy fs . > trivyfs.txt'
+                }
+            }
+        }
+
+        stage("Trivy Image Scan") {
+            steps {
+                sh "trivy image ${REPOSITORY_URI}${AWS_ECR_REPO_NAME}:${BUILD_NUMBER} > trivyimage.txt"
+            }
+        }
+
+        stage("Deploying Confluent Kafka") {
+            steps {
+                dir('kubernetes_manifests_files') {
+                    sh '''
+                        chmod +x load_c3_basic_users.sh
+                        ./load_c3_basic_users.sh
+                        kubectl create namespace confluent || true
+                        curl -O https://packages.confluent.io/bundle/cfk/confluent-for-kubernetes-2.9.6.tar.gz
+                        tar -xzvf confluent-for-kubernetes-2.9.6.tar.gz
+                        cd confluent-for-kubernetes-2.9.6-20250617131003/helm
+                        kubectl apply -f 00-kraft.yaml
+                        kubectl apply -f 01-kafka.yaml
+                        kubectl apply -f 02-controlcenter_basic.yaml
+                    '''
+                }
+            }
+        }
+    }
