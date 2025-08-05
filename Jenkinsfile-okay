@@ -62,7 +62,7 @@ pipeline {
                                 # Create namespace
                                 kubectl create namespace confluent || true
 
-                                # Download and extract CFK bundle
+ 				# Download and extract CFK bundle
                                 curl -O https://packages.confluent.io/bundle/cfk/confluent-for-kubernetes-2.9.6.tar.gz
                                 tar -xzvf confluent-for-kubernetes-2.9.6.tar.gz
 
@@ -78,9 +78,7 @@ pipeline {
                                 ./load_c3_basic_users.sh
 
                                 # Apply Kafka and Control Center manifests
-                                kubectl apply -f 00-kraft.yaml
-                                kubectl apply -f 01-kafka.yaml
-                                kubectl apply -f 02-controlcenter_basic.yaml
+                                kubectl apply -f confluent-platform-kraft-7.7.0.yaml
                             '''
                         }
                     }
