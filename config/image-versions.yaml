@@ -1,0 +1,192 @@
+# Confluent Image Version Configuration
+# This file defines the specific versions of Confluent images to use in the pipeline
+
+apiVersion: v1
+kind: Config
+metadata:
+  name: confluent-image-versions
+  description: "Version management for Confluent container images"
+  lastUpdated: "2024-01-15T10:00:00Z"
+
+# Confluent Platform Version
+confluent:
+  platform_version: "7.7.1"
+  operator_version: "0.1033.87"
+
+# Core Confluent Images
+images:
+  # Kafka Server (with Confluent Server features)
+  cp-server:
+    name: "confluentinc/cp-server"
+    version: "7.7.1"
+    description: "Confluent Server with enterprise features"
+    security_scan: true
+    
+  # Confluent Operator
+  confluent-operator:
+    name: "confluentinc/confluent-operator"
+    version: "0.1033.87"
+    description: "Confluent for Kubernetes operator"
+    security_scan: true
+    
+  # Control Center
+  cp-enterprise-control-center:
+    name: "confluentinc/cp-enterprise-control-center"
+    version: "7.7.1"
+    description: "Confluent Control Center for cluster management"
+    security_scan: true
+    
+  # Init Container
+  confluent-init-container:
+    name: "confluentinc/confluent-init-container"
+    version: "2.9.3"
+    description: "Initialization container for CFK"
+    security_scan: true
+    
+  # Schema Registry
+  cp-schema-registry:
+    name: "confluentinc/cp-schema-registry"
+    version: "7.7.1"
+    description: "Confluent Schema Registry"
+    security_scan: true
+    
+  # Kafka REST Proxy
+  cp-kafka-rest:
+    name: "confluentinc/cp-kafka-rest"
+    version: "7.7.1"
+    description: "Kafka REST Proxy"
+    security_scan: true
+    
+  # ksqlDB Server
+  cp-ksqldb-server:
+    name: "confluentinc/cp-ksqldb-server"
+    version: "7.7.1"
+    description: "ksqlDB Server for stream processing"
+    security_scan: true
+    enabled: false  # Optional component
+    
+  # Kafka Connect
+  cp-kafka-connect:
+    name: "confluentinc/cp-kafka-connect"
+    version: "7.7.1"
+    description: "Kafka Connect for data integration"
+    security_scan: true
+    enabled: false  # Optional component
+
+# Environment-specific overrides
+environments:
+  staging:
+    # Use latest tags for staging to test newer versions
+    tag_suffix: "-staging"
+    auto_update: true
+    
+  production:
+    # Use stable, tested versions for production
+    tag_suffix: "-prod"
+    auto_update: false
+    require_approval: true
+
+# Security Configuration
+security:
+  vulnerability_scanning:
+    enabled: true
+    fail_on_critical: true
+    fail_on_high: true
+    scanner: "trivy"
+    
+  image_signing:
+    enabled: false  # Set to true when using Cosign
+    key_provider: "aws-kms"
+    
+  base_image_updates:
+    enabled: true
+    schedule: "weekly"
+
+# Registry Configuration
+registry:
+  source:
+    provider: "docker.io"
+    prefix: "confluentinc"
+    
+  destination:
+    provider: "aws-ecr"
+    region: "ap-southeast-1"
+    lifecycle_policy:
+      keep_latest: 20
+      delete_untagged_after_days: 1
+
+# Deployment Configuration
+deployment:
+  staging:
+    namespace: "confluent-staging"
+    replicas:
+      kafka: 3
+      control_center: 1
+      schema_registry: 1
+    resources:
+      kafka:
+        cpu: "1000m"
+        memory: "1Gi"
+      control_center:
+        cpu: "500m"
+        memory: "2Gi"
+        
+  production:
+    namespace: "confluent-production"
+    replicas:
+      kafka: 5
+      control_center: 2
+      schema_registry: 3
+    resources:
+      kafka:
+        cpu: "4000m"
+        memory: "8Gi"
+      control_center:
+        cpu: "2000m"
+        memory: "8Gi"
+
+# Monitoring and Alerting
+monitoring:
+  metrics:
+    enabled: true
+    prometheus: true
+    grafana_dashboards: true
+    
+  logging:
+    enabled: true
+    structured: true
+    level: "INFO"
+    
+  alerting:
+    enabled: true
+    channels:
+      - slack
+      - email
+    rules:
+      - high_cpu_usage
+      - high_memory_usage
+      - pod_restart_high
+      - deployment_failure
+
+# Backup and Recovery
+backup:
+  enabled: true
+  frequency: "daily"
+  retention_days: 30
+  storage:
+    provider: "s3"
+    encryption: true
+
+# Compliance and Governance
+compliance:
+  data_retention:
+    default_days: 30
+    max_days: 365
+    
+  encryption:
+    at_rest: true
+    in_transit: true
+    
+  audit_logging:
+    enabled: true
+    retention_days: 90

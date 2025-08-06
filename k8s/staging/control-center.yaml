@@ -1,0 +1,88 @@
+apiVersion: platform.confluent.io/v1beta1
+kind: ControlCenter
+metadata:
+  name: controlcenter
+  namespace: confluent-staging
+spec:
+  replicas: 1
+  image:
+    application: ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/confluentinc/cp-enterprise-control-center:7.7.1-staging-${BUILD_NUMBER}
+    init: ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/confluentinc/confluent-init-container:2.9.3-staging-${BUILD_NUMBER}
+  dataVolumeCapacity: 50Gi
+  storageClass:
+    name: gp3-csi
+  resources:
+    requests:
+      cpu: 500m
+      memory: 2Gi
+    limits:
+      cpu: 1000m
+      memory: 4Gi
+  dependencies:
+    kafka:
+      bootstrapEndpoint: kafka:9071
+    kafkaRestProxy:
+      url: http://kafkarestproxy:8082
+  configOverrides:
+    server:
+      - "confluent.controlcenter.data.retention.time.ms=259200000" # 3 days
+      - "confluent.controlcenter.ui.autoupdate.enable=true"
+      - "confluent.controlcenter.ui.controller.chart.enable=true"
+      - "confluent.controlcenter.usage.data.collection.enable=false"
+      - "confluent.controlcenter.id=staging-control-center"
+      - "confluent.monitoring.interceptor.topic.partitions=12"
+      - "confluent.monitoring.interceptor.topic.replication=3"
+      - "confluent.metrics.topic.replication=3"
+      - "confluent.metrics.reporter.topic.replicas=3"
+  podTemplate:
+    annotations:
+      cluster-autoscaler.kubernetes.io/safe-to-evict: "false"
+    podSecurityContext:
+      fsGroup: 1001
+      runAsUser: 1001
+      runAsNonRoot: true
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: controlcenter-external
+  namespace: confluent-staging
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-type: alb
+    service.beta.kubernetes.io/aws-load-balancer-scheme: internal
+    service.beta.kubernetes.io/aws-load-balancer-target-type: ip
+    service.beta.kubernetes.io/aws-load-balancer-healthcheck-path: /
+spec:
+  type: LoadBalancer
+  selector:
+    app: controlcenter
+  ports:
+    - name: http
+      port: 80
+      targetPort: 9021
+      protocol: TCP
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: controlcenter-ingress
+  namespace: confluent-staging
+  annotations:
+    kubernetes.io/ingress.class: alb
+    alb.ingress.kubernetes.io/scheme: internal
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/healthcheck-path: /
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}]'
+    alb.ingress.kubernetes.io/tags: Environment=staging,Application=confluent-control-center
+spec:
+  rules:
+  - host: confluent-staging.internal.example.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: controlcenter
+            port:
+              number: 9021

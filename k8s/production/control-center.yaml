@@ -1,0 +1,167 @@
+apiVersion: platform.confluent.io/v1beta1
+kind: ControlCenter
+metadata:
+  name: controlcenter
+  namespace: confluent-production
+spec:
+  replicas: 2
+  image:
+    application: ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/confluentinc/cp-enterprise-control-center:production-latest
+    init: ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/confluentinc/confluent-init-container:production-latest
+  dataVolumeCapacity: 200Gi
+  storageClass:
+    name: gp3-csi
+  resources:
+    requests:
+      cpu: 1000m
+      memory: 4Gi
+    limits:
+      cpu: 2000m
+      memory: 8Gi
+  dependencies:
+    kafka:
+      bootstrapEndpoint: kafka:9071
+    kafkaRestProxy:
+      url: http://kafkarestproxy:8082
+    schemaRegistry:
+      url: http://schemaregistry:8081
+  configOverrides:
+    server:
+      - "confluent.controlcenter.data.retention.time.ms=604800000" # 7 days
+      - "confluent.controlcenter.ui.autoupdate.enable=true"
+      - "confluent.controlcenter.ui.controller.chart.enable=true"
+      - "confluent.controlcenter.usage.data.collection.enable=false"
+      - "confluent.controlcenter.id=production-control-center"
+      - "confluent.monitoring.interceptor.topic.partitions=24"
+      - "confluent.monitoring.interceptor.topic.replication=3"
+      - "confluent.metrics.topic.replication=3"
+      - "confluent.metrics.reporter.topic.replicas=3"
+      - "confluent.controlcenter.streams.num.stream.threads=8"
+      - "confluent.controlcenter.streams.cache.max.bytes.buffering=100000000"
+      - "confluent.controlcenter.kafka.bootstrap.servers=kafka:9071"
+      - "confluent.controlcenter.schema.registry.enable=true"
+      - "confluent.controlcenter.ksql.enable=false"
+      - "confluent.controlcenter.connect.enable=false"
+  podTemplate:
+    annotations:
+      cluster-autoscaler.kubernetes.io/safe-to-evict: "false"
+    podSecurityContext:
+      fsGroup: 1001
+      runAsUser: 1001
+      runAsNonRoot: true
+    affinity:
+      podAntiAffinity:
+        preferredDuringSchedulingIgnoredDuringExecution:
+        - weight: 100
+          podAffinityTerm:
+            labelSelector:
+              matchExpressions:
+              - key: app
+                operator: In
+                values:
+                - controlcenter
+            topologyKey: kubernetes.io/hostname
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: controlcenter-external
+  namespace: confluent-production
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-type: alb
+    service.beta.kubernetes.io/aws-load-balancer-scheme: internet-facing
+    service.beta.kubernetes.io/aws-load-balancer-target-type: ip
+    service.beta.kubernetes.io/aws-load-balancer-healthcheck-path: /
+    service.beta.kubernetes.io/aws-load-balancer-ssl-cert: arn:aws:acm:ap-southeast-1:${AWS_ACCOUNT_ID}:certificate/your-cert-id
+    service.beta.kubernetes.io/aws-load-balancer-listen-ports: '[{"HTTPS":443}, {"HTTP":80}]'
+    service.beta.kubernetes.io/aws-load-balancer-ssl-redirect: "443"
+spec:
+  type: LoadBalancer
+  selector:
+    app: controlcenter
+  ports:
+    - name: https
+      port: 443
+      targetPort: 9021
+      protocol: TCP
+    - name: http
+      port: 80
+      targetPort: 9021
+      protocol: TCP
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: controlcenter-ingress
+  namespace: confluent-production
+  annotations:
+    kubernetes.io/ingress.class: alb
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/healthcheck-path: /
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTPS": 443}, {"HTTP": 80}]'
+    alb.ingress.kubernetes.io/ssl-redirect: "443"
+    alb.ingress.kubernetes.io/certificate-arn: arn:aws:acm:ap-southeast-1:${AWS_ACCOUNT_ID}:certificate/your-cert-id
+    alb.ingress.kubernetes.io/tags: Environment=production,Application=confluent-control-center
+    alb.ingress.kubernetes.io/wafv2-acl-arn: arn:aws:wafv2:ap-southeast-1:${AWS_ACCOUNT_ID}:regional/webacl/confluent-production-waf/your-waf-id
+spec:
+  rules:
+  - host: confluent.production.example.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: controlcenter
+            port:
+              number: 9021
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: controlcenter-pdb
+  namespace: confluent-production
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: controlcenter
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: controlcenter-jvm-config
+  namespace: confluent-production
+data:
+  jvm.config: |
+    -server
+    -Xms4g
+    -Xmx6g
+    -XX:+UseG1GC
+    -XX:MaxGCPauseMillis=20
+    -XX:InitiatingHeapOccupancyPercent=35
+    -XX:+ExplicitGCInvokesConcurrent
+    -XX:MaxInlineLevel=15
+    -Djava.awt.headless=true
+    -Dcom.sun.management.jmxremote
+    -Dcom.sun.management.jmxremote.authenticate=false
+    -Dcom.sun.management.jmxremote.ssl=false
+    -Dcom.sun.management.jmxremote.port=9999
+    -Dkafka.logs.dir=/var/log/kafka
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: controlcenter-metrics
+  namespace: confluent-production
+  labels:
+    app: controlcenter
+spec:
+  selector:
+    matchLabels:
+      app: controlcenter
+  endpoints:
+  - port: jmx
+    interval: 30s
+    path: /metrics
