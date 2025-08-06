@@ -1,0 +1,194 @@
+apiVersion: platform.confluent.io/v1beta1
+kind: Kafka
+metadata:
+  name: kafka
+  namespace: confluent-production
+spec:
+  replicas: 5
+  image:
+    application: ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/confluentinc/cp-server:production-latest
+    init: ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/confluentinc/confluent-init-container:production-latest
+  dataVolumeCapacity: 500Gi
+  storageClass:
+    name: gp3-csi
+  resources:
+    requests:
+      cpu: 2000m
+      memory: 4Gi
+    limits:
+      cpu: 4000m
+      memory: 8Gi
+  podTemplate:
+    annotations:
+      cluster-autoscaler.kubernetes.io/safe-to-evict: "false"
+    podSecurityContext:
+      fsGroup: 1001
+      runAsUser: 1001
+      runAsNonRoot: true
+    affinity:
+      podAntiAffinity:
+        requiredDuringSchedulingIgnoredDuringExecution:
+        - labelSelector:
+            matchExpressions:
+            - key: app
+              operator: In
+              values:
+              - kafka
+          topologyKey: kubernetes.io/hostname
+  configOverrides:
+    server:
+      - "confluent.cluster.link.enable=true"
+      - "confluent.tier.enable=true"
+      - "confluent.tier.backend=S3"
+      - "confluent.tier.s3.bucket=cfk-tiered-storage-production"
+      - "confluent.tier.s3.region=${AWS_REGION}"
+      - "log.retention.hours=720" # 30 days
+      - "log.segment.bytes=1073741824"
+      - "log.retention.check.interval.ms=300000"
+      - "num.network.threads=16"
+      - "num.io.threads=32"
+      - "socket.send.buffer.bytes=102400"
+      - "socket.receive.buffer.bytes=102400"
+      - "socket.request.max.bytes=104857600"
+      - "num.partitions=12"
+      - "default.replication.factor=3"
+      - "min.insync.replicas=2"
+      - "unclean.leader.election.enable=false"
+      - "auto.create.topics.enable=false"
+      - "group.initial.rebalance.delay.ms=3000"
+      - "offsets.topic.replication.factor=3"
+      - "transaction.state.log.replication.factor=3"
+      - "transaction.state.log.min.isr=2"
+      - "compression.type=snappy"
+      - "log.cleaner.enable=true"
+      - "log.cleanup.policy=delete"
+      - "log.message.timestamp.type=CreateTime"
+      - "replica.fetch.max.bytes=1048576"
+      - "max.connections.per.ip=2000"
+      - "num.replica.fetchers=4"
+      - "replica.socket.timeout.ms=30000"
+      - "replica.socket.receive.buffer.bytes=65536"
+      - "replica.lag.time.max.ms=30000"
+  metricReporter:
+    enabled: true
+    bootstrapEndpoint: kafka:9071
+  dependencies:
+    kafkaRest:
+      authentication:
+        type: bearer
+        bearer:
+          secretRef: rest-credential
+---
+apiVersion: platform.confluent.io/v1beta1
+kind: KafkaRestProxy
+metadata:
+  name: kafkarestproxy
+  namespace: confluent-production
+spec:
+  replicas: 3
+  image:
+    application: ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/confluentinc/cp-kafka-rest:production-latest
+    init: ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/confluentinc/confluent-init-container:production-latest
+  resources:
+    requests:
+      cpu: 500m
+      memory: 1Gi
+    limits:
+      cpu: 1000m
+      memory: 2Gi
+  dependencies:
+    kafka:
+      bootstrapEndpoint: kafka:9071
+  podTemplate:
+    podSecurityContext:
+      fsGroup: 1001
+      runAsUser: 1001
+      runAsNonRoot: true
+    affinity:
+      podAntiAffinity:
+        preferredDuringSchedulingIgnoredDuringExecution:
+        - weight: 100
+          podAffinityTerm:
+            labelSelector:
+              matchExpressions:
+              - key: app
+                operator: In
+                values:
+                - kafkarestproxy
+            topologyKey: kubernetes.io/hostname
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: rest-credential
+  namespace: confluent-production
+type: Opaque
+data:
+  bearer.txt: cHJvZC1zZWNyZXQtdG9rZW4= # "prod-secret-token" base64 encoded
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kafka-external
+  namespace: confluent-production
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-type: nlb
+    service.beta.kubernetes.io/aws-load-balancer-internal: "true"
+    service.beta.kubernetes.io/aws-load-balancer-cross-zone-load-balancing-enabled: "true"
+spec:
+  type: LoadBalancer
+  selector:
+    app: kafka
+  ports:
+    - name: external
+      port: 9092
+      targetPort: 9092
+      protocol: TCP
+---
+apiVersion: platform.confluent.io/v1beta1
+kind: SchemaRegistry
+metadata:
+  name: schemaregistry
+  namespace: confluent-production
+spec:
+  replicas: 3
+  image:
+    application: ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/confluentinc/cp-schema-registry:production-latest
+    init: ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/confluentinc/confluent-init-container:production-latest
+  dependencies:
+    kafka:
+      bootstrapEndpoint: kafka:9071
+  resources:
+    requests:
+      cpu: 200m
+      memory: 512Mi
+    limits:
+      cpu: 500m
+      memory: 1Gi
+  podTemplate:
+    podSecurityContext:
+      fsGroup: 1001
+      runAsUser: 1001
+      runAsNonRoot: true
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: kafka-pdb
+  namespace: confluent-production
+spec:
+  minAvailable: 3
+  selector:
+    matchLabels:
+      app: kafka
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: kafkarestproxy-pdb
+  namespace: confluent-production
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: kafkarestproxy

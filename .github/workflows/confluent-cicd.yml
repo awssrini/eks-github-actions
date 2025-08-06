@@ -1,0 +1,461 @@
+name: 'Confluent for Kubernetes CI/CD Pipeline'
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target Environment'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+        - staging
+        - production
+      force_rebuild:
+        description: 'Force rebuild even if no image changes'
+        required: false
+        type: boolean
+        default: false
+  schedule:
+    # Run daily at 2 AM UTC to check for new images
+    - cron: '0 2 * * *'
+  push:
+    branches:
+      - main
+    paths:
+      - 'k8s/**'
+      - 'cfk/**'
+      - '.github/workflows/confluent-cicd.yml'
+
+env:
+  AWS_REGION: ap-southeast-1
+  AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+  ECR_REPOSITORY_PREFIX: "confluentinc"
+  STAGING_NAMESPACE: "confluent-staging"
+  PRODUCTION_NAMESPACE: "confluent-production"
+  
+permissions:
+  contents: read
+  security-events: write
+  actions: read
+  id-token: write
+
+jobs:
+  # 1. Image Discovery and Version Check
+  image-discovery:
+    name: "🔍 Discover Latest Images"
+    runs-on: ubuntu-latest
+    outputs:
+      images: ${{ steps.get-images.outputs.images }}
+      should_proceed: ${{ steps.check-updates.outputs.should_proceed }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Get Confluent image versions
+        id: get-images
+        run: |
+          # Define images to track
+          IMAGES=$(cat << 'EOF'
+          [
+            {
+              "name": "confluentinc/cp-server",
+              "tag": "7.7.1"
+            },
+            {
+              "name": "confluentinc/confluent-init-container", 
+              "tag": "2.9.3"
+            },
+            {
+              "name": "confluentinc/cp-enterprise-control-center",
+              "tag": "7.7.1"
+            },
+            {
+              "name": "confluentinc/confluent-operator",
+              "tag": "0.1033.87"
+            }
+          ]
+          EOF
+          )
+          echo "images=$(echo $IMAGES | jq -c .)" >> $GITHUB_OUTPUT
+
+      - name: Check for image updates
+        id: check-updates
+        run: |
+          should_proceed="false"
+          
+          if [[ "${{ github.event.inputs.force_rebuild }}" == "true" ]]; then
+            echo "Force rebuild requested"
+            should_proceed="true"
+          elif [[ "${{ github.event_name }}" == "push" ]]; then
+            echo "Code changes detected"
+            should_proceed="true"
+          elif [[ "${{ github.event_name }}" == "schedule" ]]; then
+            echo "Scheduled run - checking for image updates"
+            should_proceed="true"
+          elif [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "Manual trigger"
+            should_proceed="true"
+          fi
+          
+          echo "should_proceed=$should_proceed" >> $GITHUB_OUTPUT
+
+  # 2. Image Scanning and Security Check
+  image-security-scan:
+    name: "🔒 Security Scan Images"
+    runs-on: ubuntu-latest
+    needs: image-discovery
+    if: needs.image-discovery.outputs.should_proceed == 'true'
+    strategy:
+      matrix:
+        image: ${{ fromJson(needs.image-discovery.outputs.images) }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Pull image from Docker Hub
+        run: |
+          docker pull docker.io/${{ matrix.image.name }}:${{ matrix.image.tag }}
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: 'docker.io/${{ matrix.image.name }}:${{ matrix.image.tag }}'
+          format: 'sarif'
+          output: 'trivy-results-${{ matrix.image.name }}.sarif'
+
+      - name: Upload Trivy scan results to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: 'trivy-results-${{ matrix.image.name }}.sarif'
+
+      - name: Run Trivy for high/critical vulnerabilities
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: 'docker.io/${{ matrix.image.name }}:${{ matrix.image.tag }}'
+          format: 'table'
+          severity: 'HIGH,CRITICAL'
+          exit-code: '1'
+
+  # 3. Push Images to ECR
+  push-to-ecr:
+    name: "📦 Push to ECR"
+    runs-on: ubuntu-latest
+    needs: [image-discovery, image-security-scan]
+    if: needs.image-discovery.outputs.should_proceed == 'true'
+    strategy:
+      matrix:
+        image: ${{ fromJson(needs.image-discovery.outputs.images) }}
+    outputs:
+      staging_image_tag: ${{ steps.tag-image.outputs.staging_tag }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Create ECR repository if not exists
+        run: |
+          aws ecr describe-repositories --repository-names "${{ matrix.image.name }}" --region ${{ env.AWS_REGION }} || \
+          aws ecr create-repository --repository-name "${{ matrix.image.name }}" --region ${{ env.AWS_REGION }}
+
+      - name: Pull, tag and push image
+        id: tag-image
+        run: |
+          SOURCE_IMAGE="docker.io/${{ matrix.image.name }}:${{ matrix.image.tag }}"
+          STAGING_TAG="${{ matrix.image.tag }}-staging-${{ github.run_number }}"
+          PROD_TAG="${{ matrix.image.tag }}-prod-${{ github.run_number }}"
+          ECR_REPO="${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ matrix.image.name }}"
+          
+          # Pull from Docker Hub
+          docker pull $SOURCE_IMAGE
+          
+          # Tag for staging
+          docker tag $SOURCE_IMAGE $ECR_REPO:$STAGING_TAG
+          docker tag $SOURCE_IMAGE $ECR_REPO:staging-latest
+          
+          # Tag for production (will be promoted later)
+          docker tag $SOURCE_IMAGE $ECR_REPO:$PROD_TAG
+          
+          # Push all tags
+          docker push $ECR_REPO:$STAGING_TAG
+          docker push $ECR_REPO:staging-latest
+          docker push $ECR_REPO:$PROD_TAG
+          
+          echo "staging_tag=$STAGING_TAG" >> $GITHUB_OUTPUT
+          echo "prod_tag=$PROD_TAG" >> $GITHUB_OUTPUT
+          
+          # Store image info for later stages
+          echo "${{ matrix.image.name }}:$STAGING_TAG" >> $GITHUB_WORKSPACE/staging_images.txt
+
+      - name: Upload staging images list
+        uses: actions/upload-artifact@v4
+        with:
+          name: staging-images-${{ strategy.job-index }}
+          path: staging_images.txt
+
+  # 4. Deploy to Staging Environment
+  deploy-staging:
+    name: "🚀 Deploy to Staging"
+    runs-on: ubuntu-latest
+    needs: [image-discovery, push-to-ecr]
+    if: needs.image-discovery.outputs.should_proceed == 'true'
+    environment: staging
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Configure kubectl
+        run: |
+          aws eks update-kubeconfig --region ${{ env.AWS_REGION }} --name ${{ secrets.EKS_CLUSTER_NAME }}
+
+      - name: Download staging images artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: staging-images-*
+          merge-multiple: true
+
+      - name: Create staging namespace
+        run: |
+          kubectl create namespace ${{ env.STAGING_NAMESPACE }} --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Deploy Confluent for Kubernetes Operator
+        run: |
+          # Install CFK operator
+          helm repo add confluentinc https://packages.confluent.io/helm
+          helm repo update
+          
+          helm upgrade --install confluent-operator confluentinc/confluent-for-kubernetes \
+            --namespace ${{ env.STAGING_NAMESPACE }} \
+            --create-namespace \
+            --set image.repository="${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/confluentinc/confluent-operator" \
+            --set image.tag="0.1033.87-staging-${{ github.run_number }}" \
+            --wait
+
+      - name: Deploy Confluent Platform components
+        run: |
+          # Apply Kafka cluster configuration
+          envsubst < k8s/staging/kafka-cluster.yaml | kubectl apply -f -
+          
+          # Apply Control Center configuration
+          envsubst < k8s/staging/control-center.yaml | kubectl apply -f -
+          
+          # Wait for deployments
+          kubectl wait --for=condition=ready pod -l app=kafka --timeout=600s -n ${{ env.STAGING_NAMESPACE }}
+        env:
+          AWS_ACCOUNT_ID: ${{ env.AWS_ACCOUNT_ID }}
+          AWS_REGION: ${{ env.AWS_REGION }}
+          BUILD_NUMBER: ${{ github.run_number }}
+
+      - name: Verify staging deployment
+        run: |
+          kubectl get pods -n ${{ env.STAGING_NAMESPACE }}
+          kubectl get svc -n ${{ env.STAGING_NAMESPACE }}
+
+  # 5. Run Tests in Staging
+  test-staging:
+    name: "🧪 Test Staging Environment"
+    runs-on: ubuntu-latest
+    needs: deploy-staging
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Configure kubectl
+        run: |
+          aws eks update-kubeconfig --region ${{ env.AWS_REGION }} --name ${{ secrets.EKS_CLUSTER_NAME }}
+
+      - name: Run connectivity tests
+        run: |
+          # Test Kafka connectivity
+          kubectl exec -n ${{ env.STAGING_NAMESPACE }} kafka-0 -- kafka-broker-api-versions --bootstrap-server kafka:9092
+
+      - name: Run integration tests
+        run: |
+          # Create test topic
+          kubectl exec -n ${{ env.STAGING_NAMESPACE }} kafka-0 -- kafka-topics --create --topic test-topic --bootstrap-server kafka:9092 --partitions 3 --replication-factor 3 || true
+          
+          # Test producer/consumer
+          kubectl exec -n ${{ env.STAGING_NAMESPACE }} kafka-0 -- bash -c "echo 'test message' | kafka-console-producer --topic test-topic --bootstrap-server kafka:9092"
+          kubectl exec -n ${{ env.STAGING_NAMESPACE }} kafka-0 -- kafka-console-consumer --topic test-topic --bootstrap-server kafka:9092 --from-beginning --max-messages 1
+
+      - name: Test Control Center UI
+        run: |
+          # Port forward and test UI accessibility
+          kubectl port-forward svc/controlcenter 9021:9021 -n ${{ env.STAGING_NAMESPACE }} &
+          sleep 10
+          curl -f http://localhost:9021 || echo "Control Center not accessible"
+
+  # 6. DAST Security Scanning
+  dast-scan:
+    name: "🔍 DAST Security Scan"
+    runs-on: ubuntu-latest
+    needs: test-staging
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Configure kubectl
+        run: |
+          aws eks update-kubeconfig --region ${{ env.AWS_REGION }} --name ${{ secrets.EKS_CLUSTER_NAME }}
+
+      - name: Get service endpoints
+        id: endpoints
+        run: |
+          CONTROL_CENTER_LB=$(kubectl get svc controlcenter -n ${{ env.STAGING_NAMESPACE }} -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+          echo "control_center_url=http://$CONTROL_CENTER_LB:9021" >> $GITHUB_OUTPUT
+
+      - name: Run OWASP ZAP scan
+        uses: zaproxy/action-baseline@v0.10.0
+        with:
+          target: ${{ steps.endpoints.outputs.control_center_url }}
+          rules_file_name: '.zap/rules.tsv'
+          cmd_options: '-a'
+
+  # 7. Production Deployment (Manual Approval Required)
+  deploy-production:
+    name: "🌟 Deploy to Production"
+    runs-on: ubuntu-latest
+    needs: [image-discovery, push-to-ecr, dast-scan]
+    if: |
+      needs.image-discovery.outputs.should_proceed == 'true' && 
+      (github.event.inputs.environment == 'production' || github.ref == 'refs/heads/main')
+    environment: 
+      name: production
+      url: https://confluent-control-center.production.example.com
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Configure kubectl
+        run: |
+          aws eks update-kubeconfig --region ${{ env.AWS_REGION }} --name ${{ secrets.EKS_CLUSTER_NAME }}
+
+      - name: Create production namespace
+        run: |
+          kubectl create namespace ${{ env.PRODUCTION_NAMESPACE }} --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Deploy to Production
+        run: |
+          # Promote images to production tags
+          IMAGES=$(cat << 'EOF'
+          confluentinc/cp-server
+          confluentinc/confluent-init-container
+          confluentinc/cp-enterprise-control-center
+          confluentinc/confluent-operator
+          EOF
+          )
+          
+          for IMAGE in $IMAGES; do
+            ECR_REPO="${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/$IMAGE"
+            docker pull $ECR_REPO:staging-latest
+            docker tag $ECR_REPO:staging-latest $ECR_REPO:production-latest
+            docker tag $ECR_REPO:staging-latest $ECR_REPO:prod-${{ github.run_number }}
+            docker push $ECR_REPO:production-latest
+            docker push $ECR_REPO:prod-${{ github.run_number }}
+          done
+
+      - name: Deploy Confluent Operator to Production
+        run: |
+          helm upgrade --install confluent-operator confluentinc/confluent-for-kubernetes \
+            --namespace ${{ env.PRODUCTION_NAMESPACE }} \
+            --create-namespace \
+            --set image.repository="${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/confluentinc/confluent-operator" \
+            --set image.tag="production-latest" \
+            --wait
+
+      - name: Deploy Production Confluent Platform
+        run: |
+          # Apply production configurations
+          envsubst < k8s/production/kafka-cluster.yaml | kubectl apply -f -
+          envsubst < k8s/production/control-center.yaml | kubectl apply -f -
+          
+          # Wait for deployments
+          kubectl wait --for=condition=ready pod -l app=kafka --timeout=900s -n ${{ env.PRODUCTION_NAMESPACE }}
+        env:
+          AWS_ACCOUNT_ID: ${{ env.AWS_ACCOUNT_ID }}
+          AWS_REGION: ${{ env.AWS_REGION }}
+          BUILD_NUMBER: ${{ github.run_number }}
+
+      - name: Verify production deployment
+        run: |
+          kubectl get pods -n ${{ env.PRODUCTION_NAMESPACE }}
+          kubectl get svc -n ${{ env.PRODUCTION_NAMESPACE }}
+
+      - name: Run production smoke tests
+        run: |
+          # Basic connectivity tests
+          kubectl exec -n ${{ env.PRODUCTION_NAMESPACE }} kafka-0 -- kafka-broker-api-versions --bootstrap-server kafka:9092
+
+  # 8. Cleanup
+  cleanup:
+    name: "🧹 Cleanup"
+    runs-on: ubuntu-latest
+    needs: [deploy-production]
+    if: always()
+    steps:
+      - name: Clean up old ECR images
+        run: |
+          # Keep only the last 10 versions of each image
+          IMAGES="confluentinc/cp-server confluentinc/confluent-init-container confluentinc/cp-enterprise-control-center confluentinc/confluent-operator"
+          
+          for IMAGE in $IMAGES; do
+            aws ecr list-images --repository-name $IMAGE --region ${{ env.AWS_REGION }} \
+              --filter tagStatus=TAGGED \
+              --query 'imageIds[?imageTag!=`staging-latest` && imageTag!=`production-latest`].[imageTag]' \
+              --output text | sort -V | head -n -10 | while read TAG; do
+                if [ ! -z "$TAG" ]; then
+                  aws ecr batch-delete-image --repository-name $IMAGE --region ${{ env.AWS_REGION }} \
+                    --image-ids imageTag=$TAG || true
+                fi
+              done
+          done
+
+      - name: Cleanup Docker images
+        run: |
+          docker system prune -af
