@@ -1,7 +1,8 @@
 pipeline {
     agent any
     parameters {
-        string(name: 'Environment', defaultValue: 'dev')
+        // Change the parameter to a choice list to ensure valid environments are selected.
+        choice(name: 'Environment', choices: ['dev', 'stage', 'prod'], description: 'Select the environment to target.')
         choice(name: 'Terraform_Action', choices: ['plan', 'apply', 'destroy'])
     }
     stages {
