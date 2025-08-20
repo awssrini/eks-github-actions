@@ -1,0 +1,165 @@
+pipeline {
+    agent any
+
+    environment {
+        AWS_ACCOUNT_ID      = credentials('ACCOUNT_ID')          // Jenkins secret text credential
+        AWS_ECR_REPO_NAME   = credentials('ECR_REPO_CFK')        // Jenkins secret text credential
+        AWS_DEFAULT_REGION  = 'ap-southeast-1'
+        EKS_CLUSTER_NAME    = credentials('eks-cluster-name')    // Jenkins secret text credential
+        AWS_ACCESS_KEY_ID   = credentials('aws-access-key-id')   // Jenkins secret text credential
+        AWS_SECRET_ACCESS_KEY = credentials('aws-secret-access-key') // Jenkins secret text credential
+        STAGING_NAMESPACE   = 'confluent'
+    }
+
+    stages {
+        stage('Set REPOSITORY_URI') {
+            steps {
+                script {
+                    env.REPOSITORY_URI = "${env.AWS_ACCOUNT_ID}.dkr.ecr.${env.AWS_DEFAULT_REGION}.amazonaws.com"
+                }
+            }
+        }
+
+        stage('Git Pulling') {
+            steps {
+                git branch: 'main', url: 'https://github.com/awssrini/poc1.git'
+                sh 'ls -la'
+                sh 'ls -la kubernetes_manifests_files || echo kubernetes_manifests_files directory not found'
+            }
+        }
+
+        stage('Trivy File Scan') {
+            steps {
+                dir('kubernetes_manifests_files') {
+                    sh 'trivy fs . > trivyfs.txt'
+                }
+            }
+        }
+
+        stage('Trivy Image Scan') {
+            steps {
+                script {
+                    // FIX: Added commas after each string in the Groovy list
+                    def images = [
+                        '141884504154.dkr.ecr.ap-southeast-1.amazonaws.com/confluentinc/confluent-init-container:2.9.6',
+                        '141884504154.dkr.ecr.ap-southeast-1.amazonaws.com/confluentinc/cp-enterprise-control-center:7.7.4',
+                        '141884504154.dkr.ecr.ap-southeast-1.amazonaws.com/confluentinc/cp-enterprise-replicator:7.7.4',
+                        '141884504154.dkr.ecr.ap-southeast-1.amazonaws.com/confluentinc/cp-kafka-rest:7.7.4',
+                        '141884504154.dkr.ecr.ap-southeast-1.amazonaws.com/confluentinc/cp-ksqldb-server:7.7.4',
+                        '141884504154.dkr.ecr.ap-southeast-1.amazonaws.com/confluentinc/cp-schema-registry:7.7.4',
+                        '141884504154.dkr.ecr.ap-southeast-1.amazonaws.com/confluentinc/cp-server-connect:7.7.4',
+                        '141884504154.dkr.ecr.ap-southeast-1.amazonaws.com/confluentinc/cp-server:7.7.4',
+                        '141884504154.dkr.ecr.ap-southeast-1.amazonaws.com/confluentinc/confluent-operator:0.1033.87'
+                    ]
+
+                    images.each { image ->
+                        echo "Scanning image: ${image}"
+                        sh 'trivy image ' + image + ' > trivy-' + image.replaceAll(/[:\/]/, '-') + '.txt'
+                    }
+                }
+            }
+        }
+
+        stage('Deploying Confluent Kafka') {
+            steps {
+                // The `withEnv` block is redundant as region is already a global env var
+                withAWS(credentials: 'aws-creds', region: "${env.AWS_DEFAULT_REGION}") {
+                    dir('kubernetes_manifests_files') {
+                        sh '''
+                            # Configure kubeconfig
+                            aws eks update-kubeconfig --name ${EKS_CLUSTER_NAME} --region ${AWS_DEFAULT_REGION}
+
+                            # Create namespace
+                            kubectl create namespace ${STAGING_NAMESPACE} || true
+
+                            # Download and extract CFK bundle
+                            curl -O https://packages.confluent.io/bundle/cfk/confluent-for-kubernetes-2.9.6.tar.gz
+                            tar -xzvf confluent-for-kubernetes-2.9.6.tar.gz
+
+                            # Install Confluent Operator using Helm
+                            # NOTE: The wildcard `*` can be fragile. Ensure only one directory matches this pattern.
+                            cd confluent-for-kubernetes-2.9.6-*/helm
+                            helm upgrade --install confluent-operator --namespace ${STAGING_NAMESPACE} confluent-for-kubernetes --set kRaftEnabled=true
+
+                            # Return to kubernetes_manifests_files directory
+                            cd ../../
+
+                            # Load basic users
+                            chmod +x load_c3_basic_users.sh
+                            ./load_c3_basic_users.sh
+
+                            # Apply Kafka and Control Center manifests
+                            kubectl apply -f confluent-platform-kraft-7.7.0.yaml
+                        '''
+                    }
+                }
+            }
+        }
+
+                // ✅ Manual approval before running the test stage
+        stage('Approval for Test Staging Environment') {
+            steps {
+                script {
+                    timeout(time: 1, unit: 'HOURS') {  // Approval expires in 1 hour
+                        input message: "Proceed to run Test Staging Environment stage?", ok: "Yes, run tests"
+                    }
+                }
+            }
+        }
+
+        stage('🧪 Test Staging Environment') {
+            steps {
+                withAWS(region: "${env.AWS_DEFAULT_REGION}", credentials: 'aws-creds') {
+                    sh '''
+                        aws eks update-kubeconfig --region ${AWS_DEFAULT_REGION} --name ${EKS_CLUSTER_NAME}
+
+                        echo "🔹 Running Kafka connectivity test..."
+                        kubectl exec -n ${STAGING_NAMESPACE} kafka-0 -- kafka-broker-api-versions --bootstrap-server kafka:9092
+
+                        echo "🔹 Running Kafka integration test: Create topic..."
+                        kubectl exec -n ${STAGING_NAMESPACE} kafka-0 -- kafka-topics --create --topic test-topic --bootstrap-server kafka:9092 --partitions 3 --replication-factor 3 || true
+
+                        echo "🔹 Sending test message..."
+                        kubectl exec -n ${STAGING_NAMESPACE} kafka-0 -- bash -c "echo 'test message' | kafka-console-producer --topic test-topic --bootstrap-server kafka:9092"
+
+                        echo "🔹 Receiving test message..."
+                        kubectl exec -n ${STAGING_NAMESPACE} kafka-0 -- kafka-console-consumer --topic test-topic --bootstrap-server kafka:9092 --from-beginning --max-messages 1
+
+                        echo "🔹 Testing Control Center UI..."
+                        curl -f http://controlcenter.confluent.svc.cluster.local:9021 || echo "Control Center not accessible"
+                    '''
+                }
+            }
+        }
+        // ✅ Manual approval gate
+        stage('Approval for DAST Scan') {
+            steps {
+                script {
+                    timeout(time: 1, unit: 'HOURS') {  // Approval expires in 1 hour
+                        input message: "Proceed to run DAST Security Scan?", ok: "Yes, proceed"
+                    }
+                }
+            }
+        }
+
+        stage('🔍 DAST Security Scan') {
+            steps {
+                withAWS(region: "${env.AWS_DEFAULT_REGION}", credentials: 'aws-creds') {
+                    sh '''
+                        aws eks update-kubeconfig --region ${AWS_DEFAULT_REGION} --name ${EKS_CLUSTER_NAME}
+                        echo "🔹 Getting Control Center endpoint..."
+                        CONTROL_CENTER_LB=$(kubectl get svc controlcenter -n ${STAGING_NAMESPACE} -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+                        export CONTROL_CENTER_URL=http://$CONTROL_CENTER_LB
+                        echo "🔹 Running OWASP ZAP scan..."
+                        docker run -v $(pwd):/zap/wrk/:rw -t ghcr.io/zaproxy/zaproxy:stable zap-baseline.py \
+                            -t $CONTROL_CENTER_URL \
+                            -r zap-report.html \
+                            -a || true
+                    '''
+                    archiveArtifacts artifacts: 'zap-report.html', allowEmptyArchive: true
+                }
+            }
+        }
+
+    }
+}
