@@ -2,11 +2,20 @@ pipeline {
     agent any
 
     environment {
-        AWS_ACCOUNT_ID = credentials('ACCOUNT_ID') // Secret Text
-        AWS_ECR_REPO_NAME = credentials('ECR_REPO_CFK') // Secret Text
-        AWS_DEFAULT_REGION = 'ap-southeast-1'
-        REPOSITORY_URI = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com/"
+        AWS_ACCOUNT_ID      = credentials('ACCOUNT_ID')        // Jenkins secret text credential
+        AWS_ECR_REPO_NAME   = credentials('ECR_REPO_CFK')      // Jenkins secret text credential
+        AWS_DEFAULT_REGION  = 'ap-southeast-1'
     }
+
+    stages {
+        stage('Set REPOSITORY_URI') {
+            steps {
+                script {
+                    env.REPOSITORY_URI = "${env.AWS_ACCOUNT_ID}.dkr.ecr.${env.AWS_DEFAULT_REGION}.amazonaws.com"
+                }
+            }
+        }
+
         stage('Git Pulling') {
             steps {
                 git branch: 'main', url: 'https://github.com/awssrini/poc1.git'
@@ -14,6 +23,7 @@ pipeline {
                 sh 'ls -la kubernetes_manifests_files || echo kubernetes_manifests_files directory not found'
             }
         }
+
         stage('OWASP Dependency-Check Scan') {
             steps {
                 dir('kubernetes_manifests_files') {
@@ -31,16 +41,19 @@ pipeline {
             }
         }
 
-        stage("Trivy Image Scan") {
+        stage('Trivy Image Scan') {
             steps {
-                sh "trivy image ${REPOSITORY_URI}${AWS_ECR_REPO_NAME}:${BUILD_NUMBER} > trivyimage.txt"
+                script {
+                    sh "trivy image ${env.REPOSITORY_URI}/${env.AWS_ECR_REPO_NAME}:${env.BUILD_NUMBER} > trivyimage.txt"
+                }
             }
         }
 
-        stage("Deploying Confluent Kafka") {
+        stage('Deploying Confluent Kafka') {
             steps {
                 dir('kubernetes_manifests_files') {
                     sh '''
+                        aws eks update-kubeconfig --name dev-medium-eks-cluster --region ${env.AWS_DEFAULT_REGION}
                         chmod +x load_c3_basic_users.sh
                         ./load_c3_basic_users.sh
                         kubectl create namespace confluent || true
@@ -55,3 +68,4 @@ pipeline {
             }
         }
     }
+}
