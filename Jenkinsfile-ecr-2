@@ -1,0 +1,69 @@
+pipeline {
+    agent any
+
+    parameters {
+        choice(name: 'Terraform_Action', choices: ['plan', 'apply', 'destroy'], description: 'Choose the Terraform action to perform on ECR repositories.')
+    }
+
+    stages {
+        stage('Checkout Git Repository') {
+            steps {
+                git branch: 'main', url: 'https://github.com/awssrini/eks-github-actions.git'
+                sh 'ls -la'
+                sh 'ls -la ecr_cfk || echo ecr_cfk directory not found'
+            }
+        }
+
+        stage('Initialize Terraform') {
+            steps {
+                withAWS(credentials: 'aws-creds', region: 'ap-southeast-1') {
+                    sh 'terraform version || echo Terraform not installed - please ensure Terraform is on the agent path'
+                    sh 'terraform -chdir=ecr_cfk/ init'
+                }
+            }
+        }
+
+        stage('Validate Terraform Configuration') {
+            steps {
+                withAWS(credentials: 'aws-creds', region: 'ap-southeast-1') {
+                    sh 'terraform -chdir=ecr_cfk/ validate'
+                }
+            }
+        }
+
+        stage('Perform Terraform Action') {
+            steps {
+                withAWS(credentials: 'aws-creds', region: 'ap-southeast-1') {
+                    script {
+                        if (params.Terraform_Action == 'plan') {
+                            sh "terraform -chdir=ecr_cfk/ plan"
+                        } else if (params.Terraform_Action == 'apply') {
+                            sh "terraform -chdir=ecr_cfk/ apply -auto-approve"
+                        } else if (params.Terraform_Action == 'destroy') {
+                            sh "terraform -chdir=ecr_cfk/ destroy -auto-approve"
+                        } else {
+                            error "Invalid value for Terraform_Action: ${params.Terraform_Action}"
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Sync Images to ECR') {
+            steps {
+                sh './sync_images_to_ecr_2.sh || echo Failed to execute image sync script'
+            }
+        }
+    }
+
+    post {
+        always {
+            echo "Pipeline finished with status: ${currentBuild.currentResult}"
+            sh 'ls -R'
+        }
+        failure {
+            echo "Pipeline failed. Check logs above for details."
+        }
+    }
+}
+
